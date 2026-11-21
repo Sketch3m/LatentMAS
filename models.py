@@ -21,6 +21,10 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
 
 
 def _past_length(past_key_values: Optional[Tuple]) -> int:
+    if past_key_values is None:
+        return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        return int(past_key_values.get_seq_length())
     if not past_key_values:
         return 0
     k = past_key_values[0][0]
@@ -167,21 +171,24 @@ class ModelWrapper:
             or not hasattr(output_embeds, "weight")
         ):
             raise RuntimeError("Cannot build latent realignment matrix: embedding weights not accessible.")
-        input_weight = input_embeds.weight.detach().to(device=device, dtype=torch.float32)
+        # For the default path, skip the enormous vocabulary least-squares
+        # solve. Compute the target embedding norm in bounded GPU chunks.
+        weight = input_embeds.weight.detach()
+        total = torch.zeros((), device=device, dtype=torch.float32)
+        for start in range(0, weight.shape[0], 4096):
+            rows = weight[start:start + 4096].to(device=device, dtype=torch.float32)
+            total += rows.norm(dim=1).sum()
+        target_norm = (total / weight.shape[0]).detach()
+        if not self.latent_space_realign:
+            return torch.eye(weight.shape[1], device=device, dtype=torch.float32), target_norm
+
+        input_weight = weight.to(device=device, dtype=torch.float32)
         output_weight = output_embeds.weight.detach().to(device=device, dtype=torch.float32)
         gram = torch.matmul(output_weight.T, output_weight)
         reg = 1e-5 * torch.eye(gram.shape[0], device=gram.device, dtype=gram.dtype)
         gram = gram + reg
         rhs = torch.matmul(output_weight.T, input_weight)
         realign_matrix = torch.linalg.solve(gram, rhs)
-        target_norm = input_weight.norm(dim=1).mean().detach()
-
-        if self.args.latent_space_realign:
-            pass
-        else:
-            # keep the matrix, for further normalization
-            realign_matrix = torch.eye(realign_matrix.shape[0], device=realign_matrix.device, dtype=realign_matrix.dtype)
-
         return realign_matrix, target_norm
 
     def _ensure_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -281,6 +288,8 @@ class ModelWrapper:
         *,
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
+        latent_noise_scale: float = 0.0,
+        latent_seed: Optional[int] = None,
     ) -> Tuple:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
@@ -318,10 +327,23 @@ class ModelWrapper:
         latent_vecs_all: List[torch.Tensor] = []
         latent_vecs_all.append(e_t.detach().clone())
 
+        generator = None
+        if latent_noise_scale < 0:
+            raise ValueError("latent_noise_scale must be nonnegative")
+        if latent_noise_scale:
+            generator = torch.Generator(device=last_hidden.device)
+            generator.manual_seed(0 if latent_seed is None else int(latent_seed))
         for step in range(latent_steps):
 
             source_model = self.HF_model if hasattr(self, "HF_model") else self.model
             latent_vec = self._apply_latent_realignment(last_hidden, source_model)
+            if generator is not None:
+                # Search within continuous latent state; never modify the prompt.
+                noise = torch.randn(latent_vec.shape, device=latent_vec.device,
+                                    dtype=latent_vec.dtype, generator=generator)
+                scale = (latent_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                         / noise.norm(dim=-1, keepdim=True).clamp_min(1e-6))
+                latent_vec = latent_vec + latent_noise_scale * scale * noise
 
             latent_vecs_all.append(latent_vec.detach().clone())
 
