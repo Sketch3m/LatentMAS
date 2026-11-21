@@ -143,11 +143,15 @@ class LatentEvolution:
                 if cache_length(past) > self.max_cache_tokens:
                     raise RuntimeError("KV cache exceeded configured limit")
                 sig = signature_from_cache(past, self.latent_steps)
-                branches.append(Particle(next_id, generation, parent_id, past, sig,
-                                         novelty(sig, archive + [b.signature for b in branches])))
+                branches.append(Particle(next_id, generation, parent_id, past, sig, 0.0))
                 next_id += 1
-            # Ranking here is an approximate novelty filter, not a scientific
-            # objective. Verification is performed *after* decoded checkpoints.
+            # Compare all siblings symmetrically; otherwise the first particle
+            # is always ranked "most novel" simply because it saw no siblings.
+            for p in branches:
+                others = archive + [b.signature for b in branches if b.index != p.index]
+                p.novelty = novelty(p.signature, others)
+            # Novelty is an approximate filter, not a scientific objective.
+            # Actual verification happens only at decoded checkpoints.
             to_decode = sorted(branches, key=lambda b: b.novelty, reverse=True)[:self.decode_top_k]
             for p in to_decode:
                 answer, _ = self.model.generate_text_batch(
